@@ -9,6 +9,10 @@ import SwiftUI
 
 @main
 struct HealthCheckPOCApp: App {
+    init() {
+        print("Some fix")
+    }
+    
     var body: some Scene {
         WindowGroup {
             ContentView()
