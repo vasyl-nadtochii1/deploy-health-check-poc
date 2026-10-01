@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [test, prod]
 
+permissions:
+  contents: read
+  pull-requests: write   # needed to post the report comment on the PR
+
 jobs:
   tree-identity:
     # Promotion PRs only. On any other PR this job is skipped,
@@ -15,26 +19,222 @@ jobs:
         with:
           fetch-depth: 0
 
-      # On a pull_request event, checkout gives you GitHub's precomputed
-      # merge commit (refs/pull/N/merge), i.e. the post-merge state.
-      - name: Predicted post-merge tree must equal the source branch
+      # Rule: everything on the target branch must already be on every branch above it.
+      #   main -> test : test must be contained in main
+      #   test -> prod : prod must be contained in test AND in main
+      # "Contained" is checked by content: merging the target into the upstream
+      # branch must not change a single file of the upstream branch.
+      # Exceptions, reported as a warning and NOT failing the check:
+      #   - Swift files whose only differences are whitespace or blank lines
+      #   - Xcode project files whose only differences are version-number lines
+      #     (each branch legitimately carries its own app version)
+      # Everything else stays strict.
+      - name: Compare branch contents
+        id: cmp
         env:
           SRC: ${{ github.head_ref }}
           DST: ${{ github.base_ref }}
         run: |
-          git fetch origin "$SRC" --quiet
-          PRED=$(git rev-parse 'HEAD^{tree}')
-          SRCT=$(git rev-parse "origin/$SRC^{tree}")
-          echo "predicted tree after merge : $PRED"
-          echo "source branch tree         : $SRCT"
-          if [ "$PRED" = "$SRCT" ]; then
-            echo "OK: $DST will be byte-identical to $SRC"
-          else
-            echo "::error::After this merge, '$DST' will NOT match '$SRC'"
+          git fetch origin main test prod --quiet
+          UPSTREAMS="$SRC"
+          if [ "$DST" = "prod" ]; then UPSTREAMS="test main"; fi
+
+          LENIENT='*.swift'   # file types where whitespace-only differences are tolerated
+          VERSIONED='*.pbxproj'   # files where version-number lines may differ per branch
+          VERSION_LINES='^[[:space:]]*(MARKETING_VERSION|CURRENT_PROJECT_VERSION) = '
+          mkdir -p report
+          failed=""
+          warned=""
+          for UP in $UPSTREAMS; do
+            echo "== Is everything on '$DST' also on '$UP'?"
+            # Predict merging DST into UP without touching any branch.
+            # Exit code 1 means the merge would conflict; the tree then holds conflict markers.
+            set +e
+            OUT=$(git merge-tree --write-tree "origin/$UP" "origin/$DST")
+            status=$?
+            set -e
+            if [ "$status" -gt 1 ]; then echo "::error::git merge-tree failed"; exit 2; fi
+            conflict=$status
+            PRED=$(printf '%s\n' "$OUT" | head -1)
+            UPT=$(git rev-parse "origin/$UP^{tree}")
+
+            if [ "$conflict" = 0 ] && [ "$PRED" = "$UPT" ]; then
+              echo "OK: '$UP' already has everything that is on '$DST'"
+              echo ""
+              continue
+            fi
+
+            git diff --stat "origin/$UP" "$PRED" > "report/$UP.stat"
+            git diff "origin/$UP" "$PRED" > "report/$UP.diff"
+            [ "$conflict" = 1 ] && touch "report/$UP.conflict"
+
+            # Commits on DST that UP never received and that touch the differing files.
+            mapfile -t FILES < <(git diff --name-only "origin/$UP" "$PRED")
+            git log --no-merges --format='%H' "origin/$UP..origin/$DST" -- "${FILES[@]}" > "report/$UP.commits"
+
+            # Real difference unless: no conflict, every other file identical,
+            # Swift files identical once whitespace and blank lines are ignored,
+            # and Xcode project files identical once version-number lines are ignored.
+            if [ "$conflict" = 0 ] \
+               && git diff --quiet "origin/$UP" "$PRED" -- . ":(exclude)$LENIENT" ":(exclude)$VERSIONED" \
+               && git diff --quiet -w --ignore-blank-lines "origin/$UP" "$PRED" -- "$LENIENT" \
+               && git diff --quiet -I "$VERSION_LINES" "origin/$UP" "$PRED" -- "$VERSIONED"; then
+              warned="$warned $UP"
+              echo "::warning::'$DST' differs from '$UP' only in whitespace or version numbers (not blocking)"
+              heading="'$DST' differs from '$UP' only in whitespace or version numbers (not blocking)"
+            else
+              failed="$failed $UP"
+              echo "::error::'$DST' has changes that never reached '$UP'"
+              [ "$conflict" = 1 ] && echo "(merging '$DST' into '$UP' would also conflict; the diff shows conflict markers)"
+              heading="'$DST' has changes that never reached '$UP'"
+            fi
+            echo "Files:"
+            sed 's/^/  /' "report/$UP.stat"
+            echo "Commits on '$DST' that '$UP' is missing:"
+            while read -r sha; do
+              git log -1 --format='  %h  %an  %ad  %s' --date=short "$sha"
+            done < "report/$UP.commits"
+            echo "Exact difference (- is $UP now, + is what $UP is missing):"
+            cat "report/$UP.diff"
             echo ""
-            echo "Files that will still differ:"
-            git diff --stat "origin/$SRC" HEAD | sed 's/^/  /'
-            echo ""
-            echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
-            exit 1
-          fi
+
+            {
+              echo "### $heading"
+              echo '```diff'
+              head -c 30000 "report/$UP.diff"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "failed=$(echo $failed)" >> "$GITHUB_OUTPUT"
+          echo "warned=$(echo $warned)" >> "$GITHUB_OUTPUT"
+          echo "checked=true" >> "$GITHUB_OUTPUT"
+
+      # One comment per PR, updated in place on every run, never duplicated.
+      - name: Post or update the PR comment
+        if: steps.cmp.outputs.checked == 'true'
+        continue-on-error: true   # a failed comment must not change the check result
+        uses: actions/github-script@v7
+        env:
+          DST: ${{ github.base_ref }}
+          FAILED: ${{ steps.cmp.outputs.failed }}
+          WARNED: ${{ steps.cmp.outputs.warned }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { DST, FAILED, WARNED } = process.env;
+            const failed = FAILED.split(' ').filter(Boolean);
+            const warned = WARNED.split(' ').filter(Boolean);
+            const marker = '<!-- tree-identity-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
+            let body;
+            if (failed.length === 0 && warned.length === 0) {
+              if (!existing) return;   // nothing was ever wrong on this PR: stay quiet
+              body = `${marker}\n✅ **Resolved.** Everything on \`${DST}\` is also on the branches above it.`;
+            } else {
+              const sections = [];
+              const all = [...failed, ...warned];
+              const budget = Math.floor(50000 / all.length);   // comments max out at 65,536 chars
+              for (const up of all) {
+                const wsOnly = warned.includes(up);
+                const stat = fs.readFileSync(`report/${up}.stat`, 'utf8').trim();
+                let diff = fs.readFileSync(`report/${up}.diff`, 'utf8');
+                const truncated = diff.length > budget;
+                if (truncated) diff = diff.slice(0, budget);
+                const conflict = fs.existsSync(`report/${up}.conflict`);
+
+                // Trace each responsible commit back to the PR that merged it into DST.
+                const shas = fs.readFileSync(`report/${up}.commits`, 'utf8').split('\n').filter(Boolean);
+                const prs = new Map();
+                const orphans = [];
+                for (const sha of shas) {
+                  const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+                  const hit = data.find(p => p.base.ref === DST && p.merged_at) || data.find(p => p.base.ref === DST);
+                  if (hit) {
+                    if (!prs.has(hit.number)) prs.set(hit.number, { pr: hit, commits: [] });
+                    prs.get(hit.number).commits.push(sha.slice(0, 7));
+                  } else {
+                    orphans.push(sha.slice(0, 7));
+                  }
+                }
+                // For each source PR, offer a one-click way to bring it to `up`:
+                // an already-open back-merge PR, a prefilled "create PR" link, or a restore hint.
+                const base = `${context.serverUrl}/${owner}/${repo}`;
+                const enc = encodeURIComponent;
+                const ref = r => enc(r).replace(/%2F/g, '/');   // branch names keep their slashes in URLs
+                const traced = [];
+                for (const { pr, commits } of prs.values()) {
+                  let action;
+                  const sameRepo = pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
+                  const open = sameRepo ? (await github.rest.pulls.list({ owner, repo, state: 'open',
+                    head: `${owner}:${pr.head.ref}`, base: up })).data : [];
+                  let branchExists = false;
+                  if (sameRepo && open.length === 0) {
+                    try { await github.rest.repos.getBranch({ owner, repo, branch: pr.head.ref }); branchExists = true; }
+                    catch (e) { if (e.status !== 404) throw e; }
+                  }
+                  if (open.length) {
+                    action = `back-merge already open: #${open[0].number}`;
+                  } else if (branchExists) {
+                    const title = enc(`Back-merge #${pr.number} into ${up}: ${pr.title}`);
+                    const body = enc(`Back-merge of #${pr.number} (\`${pr.head.ref}\` → \`${DST}\`) into \`${up}\`.\n\nFlagged by the branch health check on #${issue_number}.`);
+                    action = `[**Create PR into \`${up}\`**](${base}/compare/${ref(up)}...${ref(pr.head.ref)}?expand=1&title=${title}&body=${body})`;
+                  } else {
+                    action = `branch \`${pr.head.ref}\` was deleted: restore it from #${pr.number}, or use the link below`;
+                  }
+                  traced.push(`- #${pr.number} **${pr.title}** by @${pr.user.login} (\`${pr.head.ref}\` → \`${DST}\`), commits ${commits.join(', ')} · ${action}`);
+                }
+                for (const c of orphans) traced.push(`- ${c}: no PR found (pushed directly to \`${DST}\`?)`);
+                // Fallback that always works: back-merge the whole downstream branch.
+                const allTitle = enc(`Back-merge ${DST} into ${up}`);
+                const allBody = enc(`Brings everything on \`${DST}\` that \`${up}\` is missing.\n\nFlagged by the branch health check on #${issue_number}.`);
+                const allLink = `Or bring everything at once: [**Create PR \`${DST}\` → \`${up}\`**](${base}/compare/${ref(up)}...${ref(DST)}?expand=1&title=${allTitle}&body=${allBody}). Check its diff only contains the changes listed here.`;
+
+                sections.push([
+                  wsOnly
+                    ? `### ⚠️ \`${DST}\` differs from \`${up}\` only in whitespace or version numbers (not blocking)\n_Only spacing in Swift files and/or \`MARKETING_VERSION\` / \`CURRENT_PROJECT_VERSION\` in the Xcode project differ. Expected when branches carry different app versions; this does not fail the check._`
+                    : `### ❌ \`${DST}\` has changes that never reached \`${up}\``,
+                  conflict ? `_Merging \`${DST}\` into \`${up}\` would also conflict; the diff shows the conflict markers._` : null,
+                  traced.length ? `**Introduced by:**\n${traced.join('\n')}` : null,
+                  wsOnly ? null : `\n${allLink}`,
+                  '',
+                  '```',
+                  stat,
+                  '```',
+                  '<details open><summary>Exact difference</summary>',
+                  '',
+                  '```diff',
+                  diff,
+                  '```',
+                  truncated ? '\n_Diff truncated. The job log has the full output._' : null,
+                  '</details>',
+                ].filter(l => l !== null).join('\n'));
+              }
+              body = [
+                marker,
+                failed.length === 0 ? `✅ **No blocking differences.** Only whitespace or version numbers differ.\n` : null,
+                `Everything on \`${DST}\` must also be on the branches above it. Lines with \`+\` are what is missing upstream.`,
+                '',
+                sections.join('\n\n'),
+              ].filter(l => l !== null).join('\n');
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail the check if anything is missing upstream
+        if: steps.cmp.outputs.failed != ''
+        env:
+          FAILED: ${{ steps.cmp.outputs.failed }}
+        run: |
+          echo "::error::Missing upstream in: $FAILED"
+          exit 1
