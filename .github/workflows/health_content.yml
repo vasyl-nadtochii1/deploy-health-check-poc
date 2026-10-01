@@ -1,0 +1,40 @@
+name: Branch health (content based)
+
+on:
+  pull_request:
+    branches: [test, prod]
+
+jobs:
+  tree-identity:
+    # Promotion PRs only. On any other PR this job is skipped,
+    # and a skipped job counts as passed for a required check.
+    if: (github.base_ref == 'test' && github.head_ref == 'main') || (github.base_ref == 'prod' && github.head_ref == 'test')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # On a pull_request event, checkout gives you GitHub's precomputed
+      # merge commit (refs/pull/N/merge), i.e. the post-merge state.
+      - name: Predicted post-merge tree must equal the source branch
+        env:
+          SRC: ${{ github.head_ref }}
+          DST: ${{ github.base_ref }}
+        run: |
+          git fetch origin "$SRC" --quiet
+          PRED=$(git rev-parse 'HEAD^{tree}')
+          SRCT=$(git rev-parse "origin/$SRC^{tree}")
+          echo "predicted tree after merge : $PRED"
+          echo "source branch tree         : $SRCT"
+          if [ "$PRED" = "$SRCT" ]; then
+            echo "OK: $DST will be byte-identical to $SRC"
+          else
+            echo "::error::After this merge, '$DST' will NOT match '$SRC'"
+            echo ""
+            echo "Files that will still differ:"
+            git diff --stat "origin/$SRC" HEAD | sed 's/^/  /'
+            echo ""
+            echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
+            exit 1
+          fi

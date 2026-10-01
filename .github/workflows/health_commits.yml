@@ -1,0 +1,49 @@
+name: Branch health (commit based)
+
+on:
+  push:
+    branches: [main, test, prod]
+  pull_request:
+    branches: [test, prod]
+  schedule:
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check containment
+        run: |
+          git fetch origin main test prod --quiet
+          fail=0
+          check() {
+            local up=$1 down=$2
+            local missing
+            missing=$(git cherry "origin/$up" "origin/$down" | awk '/^\+/ {print $2}')
+            if [ -n "$missing" ]; then
+              echo "::error::Commits on '$down' missing from '$up'"
+              echo ""
+              echo "Commits responsible:"
+              for sha in $missing; do
+                git log -1 --format='  %h  %<(14)%an  %ad  %s' --date=short "$sha"
+              done
+              echo ""
+              echo "To resolve:"
+              echo "  - open a PR from the fix branch into '$up', or"
+              echo "  - if the code no longer exists on '$up':"
+              echo "      git checkout $up && git merge -s ours origin/$down -m 'ack: <reason>'"
+              echo ""
+              fail=1
+            else
+              echo "OK: $down fully contained in $up"
+            fi
+          }
+          check main test
+          check main prod
+          check test prod
+          exit $fail
