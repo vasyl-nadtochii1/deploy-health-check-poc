@@ -24,8 +24,11 @@ jobs:
       #   test -> prod : prod must be contained in test AND in main
       # "Contained" is checked by content: merging the target into the upstream
       # branch must not change a single file of the upstream branch.
-      # Exception: differences in Swift files that are ONLY whitespace or blank lines
-      # are reported as a warning and do not fail the check. All other files stay strict.
+      # Exceptions, reported as a warning and NOT failing the check:
+      #   - Swift files whose only differences are whitespace or blank lines
+      #   - Xcode project files whose only differences are version-number lines
+      #     (each branch legitimately carries its own app version)
+      # Everything else stays strict.
       - name: Compare branch contents
         id: cmp
         env:
@@ -37,6 +40,8 @@ jobs:
           if [ "$DST" = "prod" ]; then UPSTREAMS="test main"; fi
 
           LENIENT='*.swift'   # file types where whitespace-only differences are tolerated
+          VERSIONED='*.pbxproj'   # files where version-number lines may differ per branch
+          VERSION_LINES='^[[:space:]]*(MARKETING_VERSION|CURRENT_PROJECT_VERSION) = '
           mkdir -p report
           failed=""
           warned=""
@@ -67,15 +72,16 @@ jobs:
             mapfile -t FILES < <(git diff --name-only "origin/$UP" "$PRED")
             git log --no-merges --format='%H' "origin/$UP..origin/$DST" -- "${FILES[@]}" > "report/$UP.commits"
 
-            # Real difference unless: no conflict, every non-Swift file identical,
-            # and Swift files identical once whitespace and blank lines are ignored.
+            # Real difference unless: no conflict, every other file identical,
+            # Swift files identical once whitespace and blank lines are ignored,
+            # and Xcode project files identical once version-number lines are ignored.
             if [ "$conflict" = 0 ] \
-               && git diff --quiet "origin/$UP" "$PRED" -- . ":(exclude)$LENIENT" \
-               && git diff --quiet -w --ignore-blank-lines "origin/$UP" "$PRED" -- "$LENIENT"; then
+               && git diff --quiet "origin/$UP" "$PRED" -- . ":(exclude)$LENIENT" ":(exclude)$VERSIONED" \
+               && git diff --quiet -w --ignore-blank-lines "origin/$UP" "$PRED" -- "$LENIENT" \
+               && git diff --quiet -I "$VERSION_LINES" "origin/$UP" "$PRED" -- "$VERSIONED"; then
               warned="$warned $UP"
-              touch "report/$UP.whitespace"
-              echo "::warning::'$DST' differs from '$UP' only in whitespace in Swift files (not blocking)"
-              heading="'$DST' differs from '$UP' only in whitespace (not blocking)"
+              echo "::warning::'$DST' differs from '$UP' only in whitespace or version numbers (not blocking)"
+              heading="'$DST' differs from '$UP' only in whitespace or version numbers (not blocking)"
             else
               failed="$failed $UP"
               echo "::error::'$DST' has changes that never reached '$UP'"
@@ -192,7 +198,7 @@ jobs:
 
                 sections.push([
                   wsOnly
-                    ? `### ⚠️ \`${DST}\` differs from \`${up}\` only in whitespace (not blocking)\n_Only blank lines or spacing in Swift files differ. Worth tidying, but this does not fail the check._`
+                    ? `### ⚠️ \`${DST}\` differs from \`${up}\` only in whitespace or version numbers (not blocking)\n_Only spacing in Swift files and/or \`MARKETING_VERSION\` / \`CURRENT_PROJECT_VERSION\` in the Xcode project differ. Expected when branches carry different app versions; this does not fail the check._`
                     : `### ❌ \`${DST}\` has changes that never reached \`${up}\``,
                   conflict ? `_Merging \`${DST}\` into \`${up}\` would also conflict; the diff shows the conflict markers._` : null,
                   traced.length ? `**Introduced by:**\n${traced.join('\n')}` : null,
@@ -212,7 +218,7 @@ jobs:
               }
               body = [
                 marker,
-                failed.length === 0 ? `✅ **No blocking differences.** Only whitespace differs.\n` : null,
+                failed.length === 0 ? `✅ **No blocking differences.** Only whitespace or version numbers differ.\n` : null,
                 `Everything on \`${DST}\` must also be on the branches above it. Lines with \`+\` are what is missing upstream.`,
                 '',
                 sections.join('\n\n'),
