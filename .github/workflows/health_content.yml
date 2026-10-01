@@ -19,59 +19,87 @@ jobs:
         with:
           fetch-depth: 0
 
-      # On a pull_request event, checkout gives you GitHub's precomputed
-      # merge commit (refs/pull/N/merge), i.e. the post-merge state.
-      - name: Compare predicted post-merge tree with the source branch
+      # Rule: everything on the target branch must already be on every branch above it.
+      #   main -> test : test must be contained in main
+      #   test -> prod : prod must be contained in test AND in main
+      # "Contained" is checked by content: merging the target into the upstream
+      # branch must not change a single file of the upstream branch.
+      - name: Compare branch contents
         id: cmp
         env:
           SRC: ${{ github.head_ref }}
           DST: ${{ github.base_ref }}
         run: |
-          git fetch origin "$SRC" --quiet
-          PRED=$(git rev-parse 'HEAD^{tree}')
-          SRCT=$(git rev-parse "origin/$SRC^{tree}")
-          echo "predicted tree after merge : $PRED"
-          echo "source branch tree         : $SRCT"
-          if [ "$PRED" = "$SRCT" ]; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "OK: $DST will be byte-identical to $SRC"
-            exit 0
-          fi
+          git fetch origin main test prod --quiet
+          UPSTREAMS="$SRC"
+          if [ "$DST" = "prod" ]; then UPSTREAMS="test main"; fi
 
-          echo "match=false" >> "$GITHUB_OUTPUT"
-          git diff --stat "origin/$SRC" HEAD > stat.txt
-          git diff "origin/$SRC" HEAD > diff.txt
+          mkdir -p report
+          failed=""
+          for UP in $UPSTREAMS; do
+            echo "== Is everything on '$DST' also on '$UP'?"
+            # Predict merging DST into UP without touching any branch.
+            # Exit code 1 means the merge would conflict; the tree then holds conflict markers.
+            set +e
+            OUT=$(git merge-tree --write-tree "origin/$UP" "origin/$DST")
+            status=$?
+            set -e
+            if [ "$status" -gt 1 ]; then echo "::error::git merge-tree failed"; exit 2; fi
+            conflict=$status
+            PRED=$(printf '%s\n' "$OUT" | head -1)
+            UPT=$(git rev-parse "origin/$UP^{tree}")
 
-          echo "::error::After this merge, '$DST' will NOT match '$SRC'"
-          echo ""
-          echo "Files that will still differ:"
-          sed 's/^/  /' stat.txt
-          echo ""
-          echo "Exact difference (- is $SRC, + is what $DST would have):"
-          cat diff.txt
-          echo ""
-          echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
+            if [ "$conflict" = 0 ] && [ "$PRED" = "$UPT" ]; then
+              echo "OK: '$UP' already has everything that is on '$DST'"
+              echo ""
+              continue
+            fi
 
-          {
-            echo "### '$DST' would not match '$SRC' after this merge"
-            echo '```diff'
-            head -c 60000 diff.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+            failed="$failed $UP"
+            git diff --stat "origin/$UP" "$PRED" > "report/$UP.stat"
+            git diff "origin/$UP" "$PRED" > "report/$UP.diff"
+            [ "$conflict" = 1 ] && touch "report/$UP.conflict"
+
+            # Commits on DST that UP never received and that touch the differing files.
+            mapfile -t FILES < <(git diff --name-only "origin/$UP" "$PRED")
+            git log --no-merges --format='%H' "origin/$UP..origin/$DST" -- "${FILES[@]}" > "report/$UP.commits"
+
+            echo "::error::'$DST' has changes that never reached '$UP'"
+            [ "$conflict" = 1 ] && echo "(merging '$DST' into '$UP' would also conflict; the diff shows conflict markers)"
+            echo "Files:"
+            sed 's/^/  /' "report/$UP.stat"
+            echo "Commits on '$DST' that '$UP' is missing:"
+            while read -r sha; do
+              git log -1 --format='  %h  %an  %ad  %s' --date=short "$sha"
+            done < "report/$UP.commits"
+            echo "Exact difference (- is $UP now, + is what $UP is missing):"
+            cat "report/$UP.diff"
+            echo ""
+
+            {
+              echo "### '$DST' has changes that never reached '$UP'"
+              echo '```diff'
+              head -c 30000 "report/$UP.diff"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "failed=$(echo $failed)" >> "$GITHUB_OUTPUT"
+          echo "checked=true" >> "$GITHUB_OUTPUT"
 
       # One comment per PR, updated in place on every run, never duplicated.
       - name: Post or update the PR comment
-        if: steps.cmp.outputs.match != ''
+        if: steps.cmp.outputs.checked == 'true'
         continue-on-error: true   # a failed comment must not change the check result
         uses: actions/github-script@v7
         env:
-          SRC: ${{ github.head_ref }}
           DST: ${{ github.base_ref }}
-          MATCH: ${{ steps.cmp.outputs.match }}
+          FAILED: ${{ steps.cmp.outputs.failed }}
         with:
           script: |
             const fs = require('fs');
-            const { SRC, DST, MATCH } = process.env;
+            const { DST, FAILED } = process.env;
+            const failed = FAILED.split(' ').filter(Boolean);
             const marker = '<!-- tree-identity-report -->';
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
@@ -81,33 +109,59 @@ jobs:
             const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
 
             let body;
-            if (MATCH === 'true') {
+            if (failed.length === 0) {
               if (!existing) return;   // nothing was ever wrong on this PR: stay quiet
-              body = `${marker}\n✅ **Resolved.** After this merge, \`${DST}\` will match \`${SRC}\` exactly.`;
+              body = `${marker}\n✅ **Resolved.** Everything on \`${DST}\` is also on the branches above it.`;
             } else {
-              const stat = fs.readFileSync('stat.txt', 'utf8').trim();
-              let diff = fs.readFileSync('diff.txt', 'utf8');
-              const limit = 55000;     // GitHub comments max out at 65,536 characters
-              const truncated = diff.length > limit;
-              if (truncated) diff = diff.slice(0, limit);
+              const sections = [];
+              const budget = Math.floor(50000 / failed.length);   // comments max out at 65,536 chars
+              for (const up of failed) {
+                const stat = fs.readFileSync(`report/${up}.stat`, 'utf8').trim();
+                let diff = fs.readFileSync(`report/${up}.diff`, 'utf8');
+                const truncated = diff.length > budget;
+                if (truncated) diff = diff.slice(0, budget);
+                const conflict = fs.existsSync(`report/${up}.conflict`);
+
+                // Trace each responsible commit back to the PR that merged it into DST.
+                const shas = fs.readFileSync(`report/${up}.commits`, 'utf8').split('\n').filter(Boolean);
+                const prs = new Map();
+                const orphans = [];
+                for (const sha of shas) {
+                  const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+                  const hit = data.find(p => p.base.ref === DST && p.merged_at) || data.find(p => p.base.ref === DST);
+                  if (hit) {
+                    if (!prs.has(hit.number)) prs.set(hit.number, { pr: hit, commits: [] });
+                    prs.get(hit.number).commits.push(sha.slice(0, 7));
+                  } else {
+                    orphans.push(sha.slice(0, 7));
+                  }
+                }
+                const traced = [...prs.values()].map(({ pr, commits }) =>
+                  `- #${pr.number} **${pr.title}** by @${pr.user.login} (\`${pr.head.ref}\` → \`${DST}\`), commits ${commits.join(', ')}`);
+                for (const c of orphans) traced.push(`- ${c}: no PR found (pushed directly to \`${DST}\`?)`);
+
+                sections.push([
+                  `### ❌ \`${DST}\` has changes that never reached \`${up}\``,
+                  conflict ? `_Merging \`${DST}\` into \`${up}\` would also conflict; the diff shows the conflict markers._` : null,
+                  traced.length ? `**Introduced by:**\n${traced.join('\n')}` : null,
+                  '',
+                  '```',
+                  stat,
+                  '```',
+                  '<details open><summary>Exact difference</summary>',
+                  '',
+                  '```diff',
+                  diff,
+                  '```',
+                  truncated ? '\n_Diff truncated. The job log has the full output._' : null,
+                  '</details>',
+                ].filter(l => l !== null).join('\n'));
+              }
               body = [
                 marker,
-                `❌ **After this merge, \`${DST}\` will NOT match \`${SRC}\`.**`,
+                `Everything on \`${DST}\` must also be on the branches above it. Lines with \`+\` are what is missing upstream.`,
                 '',
-                `Lines with \`+\` are on \`${DST}\` but missing from \`${SRC}\`, usually a fix that was never back-merged.`,
-                `Lines with \`-\` are on \`${SRC}\` but would be missing from \`${DST}\`.`,
-                '',
-                '```',
-                stat,
-                '```',
-                '',
-                '<details open><summary>Exact difference</summary>',
-                '',
-                '```diff',
-                diff,
-                '```',
-                truncated ? '\n_Diff truncated. The job log has the full output._' : '',
-                '</details>',
+                sections.join('\n\n'),
               ].join('\n');
             }
 
@@ -117,6 +171,10 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-      - name: Fail the check if the branches would differ
-        if: steps.cmp.outputs.match == 'false'
-        run: exit 1
+      - name: Fail the check if anything is missing upstream
+        if: steps.cmp.outputs.failed != ''
+        env:
+          FAILED: ${{ steps.cmp.outputs.failed }}
+        run: |
+          echo "::error::Missing upstream in: $FAILED"
+          exit 1
