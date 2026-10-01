@@ -17,6 +17,8 @@ struct ContentView: View {
                 .padding()
             Text("Hello world!")
                 .foregroundStyle(.blue)
+            Text("Text added by hotfix")
+                .foregroundStyle(.green)
         }
         .padding()
         .background(Color.yellow)
