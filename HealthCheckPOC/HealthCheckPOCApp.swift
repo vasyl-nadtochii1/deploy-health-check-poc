@@ -10,7 +10,7 @@ import SwiftUI
 @main
 struct HealthCheckPOCApp: App {
     init() {
-        print("Some fix #2")
+        print("Some fix #4")
     }
     
     var body: some Scene {
