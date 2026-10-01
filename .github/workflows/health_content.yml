@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [test, prod]
 
+permissions:
+  contents: read
+  pull-requests: write   # needed to post the report comment on the PR
+
 jobs:
   tree-identity:
     # Promotion PRs only. On any other PR this job is skipped,
@@ -17,7 +21,8 @@ jobs:
 
       # On a pull_request event, checkout gives you GitHub's precomputed
       # merge commit (refs/pull/N/merge), i.e. the post-merge state.
-      - name: Predicted post-merge tree must equal the source branch
+      - name: Compare predicted post-merge tree with the source branch
+        id: cmp
         env:
           SRC: ${{ github.head_ref }}
           DST: ${{ github.base_ref }}
@@ -28,13 +33,90 @@ jobs:
           echo "predicted tree after merge : $PRED"
           echo "source branch tree         : $SRCT"
           if [ "$PRED" = "$SRCT" ]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
             echo "OK: $DST will be byte-identical to $SRC"
-          else
-            echo "::error::After this merge, '$DST' will NOT match '$SRC'"
-            echo ""
-            echo "Files that will still differ:"
-            git diff --stat "origin/$SRC" HEAD | sed 's/^/  /'
-            echo ""
-            echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
-            exit 1
+            exit 0
           fi
+
+          echo "match=false" >> "$GITHUB_OUTPUT"
+          git diff --stat "origin/$SRC" HEAD > stat.txt
+          git diff "origin/$SRC" HEAD > diff.txt
+
+          echo "::error::After this merge, '$DST' will NOT match '$SRC'"
+          echo ""
+          echo "Files that will still differ:"
+          sed 's/^/  /' stat.txt
+          echo ""
+          echo "Exact difference (- is $SRC, + is what $DST would have):"
+          cat diff.txt
+          echo ""
+          echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
+
+          {
+            echo "### '$DST' would not match '$SRC' after this merge"
+            echo '```diff'
+            head -c 60000 diff.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment per PR, updated in place on every run, never duplicated.
+      - name: Post or update the PR comment
+        if: steps.cmp.outputs.match != ''
+        continue-on-error: true   # a failed comment must not change the check result
+        uses: actions/github-script@v7
+        env:
+          SRC: ${{ github.head_ref }}
+          DST: ${{ github.base_ref }}
+          MATCH: ${{ steps.cmp.outputs.match }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { SRC, DST, MATCH } = process.env;
+            const marker = '<!-- tree-identity-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
+            let body;
+            if (MATCH === 'true') {
+              if (!existing) return;   // nothing was ever wrong on this PR: stay quiet
+              body = `${marker}\n✅ **Resolved.** After this merge, \`${DST}\` will match \`${SRC}\` exactly.`;
+            } else {
+              const stat = fs.readFileSync('stat.txt', 'utf8').trim();
+              let diff = fs.readFileSync('diff.txt', 'utf8');
+              const limit = 55000;     // GitHub comments max out at 65,536 characters
+              const truncated = diff.length > limit;
+              if (truncated) diff = diff.slice(0, limit);
+              body = [
+                marker,
+                `❌ **After this merge, \`${DST}\` will NOT match \`${SRC}\`.**`,
+                '',
+                `Lines with \`+\` are on \`${DST}\` but missing from \`${SRC}\`, usually a fix that was never back-merged.`,
+                `Lines with \`-\` are on \`${SRC}\` but would be missing from \`${DST}\`.`,
+                '',
+                '```',
+                stat,
+                '```',
+                '',
+                '<details open><summary>Exact difference</summary>',
+                '',
+                '```diff',
+                diff,
+                '```',
+                truncated ? '\n_Diff truncated. The job log has the full output._' : '',
+                '</details>',
+              ].join('\n');
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail the check if the branches would differ
+        if: steps.cmp.outputs.match == 'false'
+        run: exit 1
