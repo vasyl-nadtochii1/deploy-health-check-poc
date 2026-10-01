@@ -42,6 +42,11 @@ jobs:
           git diff --stat "origin/$SRC" HEAD > stat.txt
           git diff "origin/$SRC" HEAD > diff.txt
 
+          # Commits on '$DST' (HEAD^1 = base side of the PR merge) that '$SRC' never received
+          # and that touch the differing files: these are the changes to back-merge.
+          mapfile -t FILES < <(git diff --name-only "origin/$SRC" HEAD)
+          git log --no-merges --format='%H' "origin/$SRC..HEAD^1" -- "${FILES[@]}" > commits.txt
+
           echo "::error::After this merge, '$DST' will NOT match '$SRC'"
           echo ""
           echo "Files that will still differ:"
@@ -49,6 +54,11 @@ jobs:
           echo ""
           echo "Exact difference (- is $SRC, + is what $DST would have):"
           cat diff.txt
+          echo ""
+          echo "Commits on '$DST' that '$SRC' is missing:"
+          while read -r sha; do
+            git log -1 --format='  %h  %an  %ad  %s' --date=short "$sha"
+          done < commits.txt
           echo ""
           echo "Most likely cause: a fix applied to '$DST' that never reached '$SRC'."
 
@@ -86,6 +96,27 @@ jobs:
               body = `${marker}\n✅ **Resolved.** After this merge, \`${DST}\` will match \`${SRC}\` exactly.`;
             } else {
               const stat = fs.readFileSync('stat.txt', 'utf8').trim();
+
+              // Trace each responsible commit back to the PR that merged it into DST.
+              const shas = fs.readFileSync('commits.txt', 'utf8').split('\n').filter(Boolean);
+              const prs = new Map();
+              const orphans = [];
+              for (const sha of shas) {
+                const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+                const hit = data.find(p => p.base.ref === DST && p.merged_at) || data.find(p => p.base.ref === DST);
+                if (hit) {
+                  if (!prs.has(hit.number)) prs.set(hit.number, { pr: hit, commits: [] });
+                  prs.get(hit.number).commits.push(sha.slice(0, 7));
+                } else {
+                  orphans.push(sha.slice(0, 7));
+                }
+              }
+              const traced = [...prs.values()].map(({ pr, commits }) =>
+                `- #${pr.number} **${pr.title}** by @${pr.user.login} (\`${pr.head.ref}\` → \`${DST}\`), commits ${commits.join(', ')}`);
+              for (const c of orphans) traced.push(`- ${c}: no PR found (pushed directly to \`${DST}\`?)`);
+              const traceBlock = traced.length
+                ? ['**Changes that never reached `' + SRC + '`:**', ...traced, '']
+                : [];
               let diff = fs.readFileSync('diff.txt', 'utf8');
               const limit = 55000;     // GitHub comments max out at 65,536 characters
               const truncated = diff.length > limit;
@@ -97,6 +128,7 @@ jobs:
                 `Lines with \`+\` are on \`${DST}\` but missing from \`${SRC}\`, usually a fix that was never back-merged.`,
                 `Lines with \`-\` are on \`${SRC}\` but would be missing from \`${DST}\`.`,
                 '',
+                ...traceBlock,
                 '```',
                 stat,
                 '```',
