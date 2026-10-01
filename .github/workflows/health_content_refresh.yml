@@ -1,0 +1,76 @@
+name: Branch health (refresh open promotions)
+
+# GitHub re-runs PR checks only when the PR's own branch gets new commits,
+# never when the branch it merges INTO moves. Without this workflow, a promotion
+# PR can stay green after a new hotfix lands on test or prod.
+# On every push to a release branch, this re-runs the content check on each
+# open promotion PR whose result depends on that branch.
+
+on:
+  push:
+    branches: [main, test, prod]
+
+permissions:
+  actions: write        # re-run workflow runs
+  pull-requests: read   # find open promotion PRs
+
+concurrency:
+  group: health-refresh-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pushed = context.ref.replace('refs/heads/', '');
+
+            // Promotion PRs whose result depends on `pushed` WITHOUT `pushed` being
+            // their own head branch (a push to the head branch already re-runs the check).
+            //   main -> test PR checks: test vs main            -> depends on a push to test
+            //   test -> prod PR checks: prod vs test, prod vs main -> depends on a push to prod or main
+            const dependents = {
+              test: [{ base: 'test', head: 'main' }],
+              prod: [{ base: 'prod', head: 'test' }],
+              main: [{ base: 'prod', head: 'test' }],
+            }[pushed] || [];
+
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+            for (const { base, head } of dependents) {
+              const { data: prs } = await github.rest.pulls.list({
+                owner, repo, state: 'open', base, head: `${owner}:${head}` });
+
+              for (const pr of prs) {
+                // Latest content-check run for this PR's current head commit.
+                const findRun = async () => {
+                  const { data } = await github.rest.actions.listWorkflowRuns({
+                    owner, repo, workflow_id: 'health_content.yml',
+                    event: 'pull_request', head_sha: pr.head.sha, per_page: 20 });
+                  return data.workflow_runs.find(r =>
+                    (r.pull_requests || []).some(p => p.number === pr.number)) || data.workflow_runs[0];
+                };
+
+                let run = await findRun();
+                if (!run) {
+                  core.warning(`#${pr.number}: no content-check run found to refresh`);
+                  continue;
+                }
+                // A run that is still going may have read the branches before this push:
+                // wait for it to finish (up to 5 minutes), then re-run it.
+                for (let i = 0; i < 20 && run.status !== 'completed'; i++) {
+                  await sleep(15000);
+                  run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
+                }
+                if (run.status !== 'completed') {
+                  core.warning(`#${pr.number}: run ${run.id} still in progress, could not refresh`);
+                  continue;
+                }
+
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                core.info(`#${pr.number} (${head} -> ${base}): re-running content check (run ${run.id}) because '${pushed}' moved`);
+              }
+            }
